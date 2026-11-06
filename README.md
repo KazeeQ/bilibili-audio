@@ -1,3 +1,4 @@
+!!!全程向大肥鱼许愿的产物 如有什么不妥或者bug欢迎B站私信我（ID：山乞yC）或者向大肥鱼许愿来完善QAQ
 # DSH Bilibili Audio
 
 给 DeepSeek Harness Web UI 用的 B 站音频播放器插件：左侧栏入口、BV 号 / 链接解析、关键词搜索、本地收藏，以及一条会跟着音乐频谱跳动的 RGB 迷你播放条。
