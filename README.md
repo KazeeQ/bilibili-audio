@@ -23,7 +23,10 @@ bilibili-audio/
 ├── locale/
 │   ├── zh.json
 │   └── en.json
-└── icon.svg
+├── icon.svg
+├── README.md
+├── LICENSE
+└── .gitignore
 ```
 
 ## 安装
@@ -58,10 +61,12 @@ git clone <repo-url> bilibili-audio
 | 路由 | 说明 |
 | --- | --- |
 | `GET /bili-audio/api/resolve?raw=` | 解析 BV / av / 短链，返回曲目信息与流地址 |
-| `GET /bili-audio/api/search?keyword=` | 调用 B 站 wbi 搜索接口，返回视频列表 |
-| `GET /bili-audio/api/stream?u=` | 代理音频流，支持 Range，仅放行白名单域名 |
+| `GET /bili-audio/api/search?keyword=&page=` | 调用 B 站 wbi 搜索接口，返回视频列表（`page` 1–5） |
+| `GET /bili-audio/api/stream?u=&v=` | 代理音频流，支持 Range，仅放行白名单域名 |
 
 音频流地址经 base64url 编码后传给客户端，规避跨域与防盗链。
+
+`stream` 路由带断流续传：CDN 中途断开时用 Range 从断点重连（最多 3 次），并给下游流挂 `error` 处理器，避免上游异常升级成 `uncaughtException` 带走 host 进程。
 
 **Client 半边**（`client.js`）注册三个槽位：
 
@@ -69,7 +74,7 @@ git clone <repo-url> bilibili-audio
 - `main` —— 主面板内容
 - `shell.overlay` —— 顶部迷你条
 
-频谱可视化使用 Web Audio `AnalyserNode`：优先 `createMediaElementSource`（仅当 `AudioContext` 已处于 `running` 才接管，避免把音频静音），否则退回不接管输出的 `captureStream`。亮度映射用固定 dB 窗口（`-45dB ~ -8dB`），避免正常音量就顶满。
+频谱可视化使用 Web Audio `AnalyserNode`：优先 `createMediaElementSource`（仅当 `AudioContext` 已处于 `running` 才接管，避免把音频静音），否则退回不接管输出的 `captureStream`。亮度映射用固定 dB 窗口（`-50dB ~ -12dB`），避免正常音量就顶满。
 
 ## 说明与限制
 
