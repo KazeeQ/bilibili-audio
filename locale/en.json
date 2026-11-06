@@ -1,0 +1,9 @@
+{
+  "meta": {
+    "title": "Bilibili Audio",
+    "description": "A Bilibili audio player in the sidebar: paste a BV id or video link to save and play it."
+  },
+  "panel": "Bilibili Audio",
+  "title": "Bilibili Audio",
+  "subtitle": "Paste a BV id or a video link and listen right here."
+}
