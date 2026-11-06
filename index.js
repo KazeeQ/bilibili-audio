@@ -282,6 +282,101 @@ async function handleSearch(req, res) {
   sendJson(res, 200, payload)
 }
 
+// ── 断流续传 ─────────────────────────────────────────────────────────────
+// B 站的音频 CDN 会莫名其妙地在传输中途断开（长连接回收 / Range 被拒 / 风控）。
+// 浏览器那边只会看到「播放停了」，而 host 进程这边如果没人处理流错误，就是
+// uncaughtException → 整个应用退出。所以这里做两件事：
+//   1) 接住流错误（不再升级为进程级异常）
+//   2) 用 Range 从断点续传，播放器无感
+const MAX_STREAM_RETRIES = 3
+const STREAM_RETRY_BASE_DELAY_MS = 250
+
+function contentRangeStart(header) {
+  if (typeof header !== 'string') return null
+  const match = /^bytes\s+(\d+)-/i.exec(header.trim())
+  return match === null ? null : Number(match[1])
+}
+
+// 写入一块数据；返回 false 表示对端已断开，没必要再拉了。
+function writeChunk(res, chunk) {
+  return new Promise((resolve) => {
+    if (res.destroyed || res.writableEnded) {
+      resolve(false)
+      return
+    }
+    if (res.write(chunk)) {
+      resolve(true)
+      return
+    }
+    const done = () => {
+      res.off('drain', done)
+      res.off('close', done)
+      resolve(!res.destroyed && !res.writableEnded)
+    }
+    res.on('drain', done)
+    res.on('close', done)
+  })
+}
+
+async function pumpBody(upstream, res, progress) {
+  if (upstream.body === null || upstream.body === undefined) return
+  const reader = upstream.body.getReader()
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) return
+      if (value === undefined || value.byteLength === 0) continue
+      progress.bytes += value.byteLength
+      const alive = await writeChunk(res, Buffer.from(value.buffer, value.byteOffset, value.byteLength))
+      if (!alive) return
+    }
+  } finally {
+    try {
+      await reader.cancel()
+    } catch {}
+  }
+}
+
+/**
+ * 把上游 body 搬到 res 上；中途断流就从断点用 Range 续传。
+ * 返回 true 表示 body 已经完整写完，调用方负责 res.end()。
+ */
+async function pumpWithRetry({ first, target, reqHeaders, res, signal, startOffset }) {
+  let upstream = first
+  let offset = startOffset
+  let attempt = 0
+  const progress = { bytes: 0 }
+
+  for (;;) {
+    try {
+      await pumpBody(upstream, res, progress)
+      return true
+    } catch (error) {
+      if (signal.aborted || res.destroyed || res.writableEnded) return false
+      if (attempt >= MAX_STREAM_RETRIES) throw error
+      attempt += 1
+      await new Promise((resolve) => setTimeout(resolve, STREAM_RETRY_BASE_DELAY_MS * attempt))
+      if (signal.aborted || res.destroyed || res.writableEnded) return false
+
+      const resumeFrom = offset + progress.bytes
+      const retried = await fetch(target, {
+        headers: { ...reqHeaders, range: `bytes=${resumeFrom}-` },
+        signal,
+      })
+      const resumedAt = contentRangeStart(retried.headers.get('content-range'))
+      if (retried.status !== 206 || resumedAt !== resumeFrom) {
+        // 服务端没按 Range 续传（或起点对不上），继续写会错位，放弃这轮播放，
+        // 让播放器自己重新发请求，比写出一段坏音频强。
+        await retried.body?.cancel().catch(() => {})
+        return false
+      }
+      offset = resumedAt
+      progress.bytes = 0
+      upstream = retried
+    }
+  }
+}
+
 async function handleStream(req, res) {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     sendJson(res, 405, { ok: false, error: 'method not allowed' })
@@ -364,7 +459,11 @@ async function handleStream(req, res) {
         return
       }
       try {
-        Readable.from(sliceBody(Readable.fromWeb(upstream.body), wanted.start, wanted.end)).pipe(res)
+        const sliced = Readable.from(sliceBody(Readable.fromWeb(upstream.body), wanted.start, wanted.end))
+        // 流被 CDN 半路掐断时只会抛异步 'error' 事件，外层 try/catch 接不住；
+        // 不挂 handler 就会升级成 uncaughtException，直接带走整个 host 进程。
+        sliced.on('error', () => res.destroy())
+        sliced.pipe(res)
       } catch {
         res.destroy()
       }
@@ -387,7 +486,19 @@ async function handleStream(req, res) {
       res.end()
       return
     }
-    Readable.fromWeb(upstream.body).pipe(res)
+    const completed = await pumpWithRetry({
+      first: upstream,
+      target,
+      reqHeaders: headers,
+      res,
+      signal: controller.signal,
+      startOffset: contentRangeStart(upstream.headers.get('content-range')) ?? 0,
+    })
+    if (completed) {
+      res.end()
+    } else {
+      res.destroy()
+    }
   } catch (error) {
     if (controller.signal.aborted) return
     if (!res.headersSent) {

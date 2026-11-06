@@ -372,8 +372,8 @@ window.__ModuleLoader__.load({
       // narrower window so ordinary music never pins the glow at maximum.
       const ANALYSER_MIN_DB = -90
       const ANALYSER_MAX_DB = -5
-      const LEVEL_FLOOR_DB = -45
-      const LEVEL_CEIL_DB = -8
+      const LEVEL_FLOOR_DB = -50
+      const LEVEL_CEIL_DB = -12
 
       /**
        * Frequency analysis for the rim. A context may only take over the element
@@ -398,7 +398,7 @@ window.__ModuleLoader__.load({
             node.fftSize = 1024
             node.minDecibels = ANALYSER_MIN_DB
             node.maxDecibels = ANALYSER_MAX_DB
-            node.smoothingTimeConstant = 0.55
+            node.smoothingTimeConstant = 0.2
             source.connect(node)
             node.connect(ctx.destination)
             audioCtx = ctx
@@ -419,7 +419,7 @@ window.__ModuleLoader__.load({
           node.fftSize = 1024
           node.minDecibels = ANALYSER_MIN_DB
           node.maxDecibels = ANALYSER_MAX_DB
-          node.smoothingTimeConstant = 0.55
+          node.smoothingTimeConstant = 0.2
           source.connect(node)
           audioCtx = ctx
           analyser = node
@@ -571,7 +571,7 @@ window.__ModuleLoader__.load({
           }
           const target = Math.min(1, top * 1.02)
           const previous = spectrumCache[i]
-          spectrumCache[i] = previous + (target - previous) * (target > previous ? 0.42 : 0.1)
+          spectrumCache[i] = previous + (target - previous) * (target > previous ? 0.78 : 0.16)
         }
         return spectrumCache
       }
@@ -658,8 +658,8 @@ input.bili-audio-range:disabled{cursor:default;opacity:.45;}
 input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-brand-primary);cursor:pointer;margin:0;}
 .bili-audio-mini{position:fixed;top:6px;left:50%;transform:translateX(-50%);z-index:60;display:flex;align-items:center;gap:3px;padding:5px;border-radius:999px;background:transparent;border:none;max-width:min(420px,38vw);pointer-events:auto;color:var(--dsw-alias-label-primary);-webkit-app-region:no-drag;app-region:no-drag;animation:bili-audio-mini-in 460ms cubic-bezier(.22,.9,.24,1) both;transform-origin:center;isolation:isolate;}
 .bili-audio-mini::before{content:"";position:absolute;inset:0;box-sizing:border-box;border-radius:inherit;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);box-shadow:0 1px 3px rgba(0,0,0,.10);z-index:-1;pointer-events:none;transition:background .18s ease;}
-.bili-audio-mini::after{content:"";position:absolute;inset:-1px;border-radius:inherit;background:var(--bili-rim,conic-gradient(from 0deg,#ff4d6d,#ffb84d,#7dff9c,#4dd2ff,#8b5cf6,#ff5fd2,#ff4d6d));filter:blur(calc(4px + var(--bili-audio-energy,0) * 3px)) saturate(calc(1.05 + var(--bili-audio-energy,0) * 1.05));opacity:0;transform:scale(calc(1 + var(--bili-audio-energy,0) * 0.025));z-index:-2;pointer-events:none;transition:opacity .12s ease-out;}
-.bili-audio-mini.is-playing::after{opacity:calc(0.08 + var(--bili-audio-energy,0) * 0.92);}
+.bili-audio-mini::after{content:"";position:absolute;inset:-1px;border-radius:inherit;background:var(--bili-rim,conic-gradient(from 0deg,#ff4d6d,#ffb84d,#7dff9c,#4dd2ff,#8b5cf6,#ff5fd2,#ff4d6d));filter:blur(calc(4px + var(--bili-audio-energy,0) * 3px)) saturate(calc(1.05 + var(--bili-audio-energy,0) * 1.05));opacity:0;transform:scale(calc(1 + var(--bili-audio-energy,0) * 0.025));z-index:-2;pointer-events:none;transition:opacity .05s linear;}
+.bili-audio-mini.is-playing::after{opacity:calc(0.12 + var(--bili-audio-energy,0) * 0.88);}
 @keyframes bili-audio-mini-in{
   0%{opacity:0;transform:translate(-50%,0) scale(.26,.46);}
   58%{opacity:1;transform:translate(-50%,0) scale(1.06,1.09);}
@@ -881,9 +881,9 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
           } catch {
             next = 0
           }
-          smooth += (next - smooth) * (next > smooth ? 1 - Math.exp(-dt * 30) : 1 - Math.exp(-dt * 10))
+          smooth += (next - smooth) * (next > smooth ? 1 - Math.exp(-dt * 60) : 1 - Math.exp(-dt * 12))
           angle = (angle + (38 + smooth * 380) * dt) % 360
-          if (bands !== null && bands.length > 0 && now - lastRim > 33) {
+          if (bands !== null && bands.length > 0 && now - lastRim > 15) {
             lastRim = now
             let rim = 'conic-gradient(from ' + angle.toFixed(1) + 'deg'
             for (let i = 0; i < bands.length; i += 1) {
