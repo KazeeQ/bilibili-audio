@@ -241,6 +241,18 @@ window.__ModuleLoader__.load({
         emit({ tracks: next })
       }
 
+      let objectUrl = null
+
+      function releaseObjectUrl() {
+        if (objectUrl === null) return
+        try {
+          URL.revokeObjectURL(objectUrl)
+        } catch {
+          /* ignore */
+        }
+        objectUrl = null
+      }
+
       async function open(raw) {
         const value = String(raw ?? '').trim()
         if (value === '') return
@@ -258,16 +270,28 @@ window.__ModuleLoader__.load({
           rememberTrack(track)
           writeLast(track.bvid)
           pendingSeek = null
-          audio.src = track.streamUrl
-          audio.currentTime = 0
           emit({
             current: track,
             duration: Number(track.duration) || 0,
             time: 0,
-            loading: false,
+            loading: true,
             seeking: false,
             error: '',
           })
+          // The desktop shell serves the UI from `dsh-app://`, whose handler does
+          // not honour byte ranges — a media element pointed at it reports
+          // `seekable = [0,0]` and refuses every seek. Pulling the bytes through
+          // fetch and handing the element a blob: URL keeps seeking local.
+          const data = await fetch(track.streamUrl)
+          if (mine !== sequence) return
+          if (!data.ok) throw new Error(`音频下载失败 HTTP ${data.status}`)
+          const buffer = await data.arrayBuffer()
+          if (mine !== sequence) return
+          releaseObjectUrl()
+          objectUrl = URL.createObjectURL(new Blob([buffer], { type: 'audio/mp4' }))
+          audio.src = objectUrl
+          audio.currentTime = 0
+          emit({ loading: false, time: 0, seeking: false })
           ensureAnalyser()
           const attempt = audio.play()
           if (attempt !== undefined && typeof attempt.catch === 'function') {
@@ -302,13 +326,50 @@ window.__ModuleLoader__.load({
         if (target !== undefined) open(target.bvid)
       }
 
+      const reportSeek = (tag, extra) => {
+        try {
+          const ranges = []
+          for (let i = 0; i < audio.seekable.length; i += 1) {
+            ranges.push([Number(audio.seekable.start(i).toFixed(2)), Number(audio.seekable.end(i).toFixed(2))])
+          }
+          const buffered = []
+          for (let i = 0; i < audio.buffered.length; i += 1) {
+            buffered.push([Number(audio.buffered.start(i).toFixed(2)), Number(audio.buffered.end(i).toFixed(2))])
+          }
+          fetch(`${API}report`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              tag,
+              bvid: state.current === null ? '' : state.current.bvid,
+              origin: typeof location === 'object' ? location.origin : '-',
+              href: typeof location === 'object' ? String(location.href).slice(0, 120) : '-',
+              src: String(audio.src).slice(0, 90),
+              t: Number(audio.currentTime.toFixed(3)),
+              dur: audio.duration,
+              ready: audio.readyState,
+              seeking: audio.seeking,
+              paused: audio.paused,
+              seekable: ranges,
+              buffered,
+              ...extra,
+            }),
+          }).catch(() => {})
+        } catch {
+          /* diagnostics must never break playback */
+        }
+      }
+
       function applySeek(target) {
+        reportSeek('apply-start', { target })
         pendingSeek = target
         pendingSince = Date.now()
         emit({ time: target, seeking: true })
         try {
           audio.currentTime = target
-        } catch {
+          reportSeek('apply-set', { target })
+        } catch (error) {
+          reportSeek('apply-throw', { target, error: String(error) })
           pendingSeek = null
           emit({ seeking: false })
         }
@@ -353,10 +414,12 @@ window.__ModuleLoader__.load({
 
       function stop() {
         sequence += 1
+        cancelAutoSkip()
         pendingSeek = null
         audio.pause()
         audio.removeAttribute('src')
         audio.load()
+        releaseObjectUrl()
         writeLast('')
         emit({ current: null, playing: false, time: 0, duration: 0, seeking: false, error: '' })
       }
@@ -504,6 +567,7 @@ window.__ModuleLoader__.load({
         const current = Number(audio.currentTime) || 0
         if (pendingSeek !== null) {
           if (Math.abs(current - pendingSeek) <= 1.5 || Date.now() - pendingSince > 12000) {
+            reportSeek('lock-release', { target: pendingSeek, current })
             pendingSeek = null
             emit({ time: current, seeking: false })
             return
@@ -515,6 +579,7 @@ window.__ModuleLoader__.load({
         emit({ time: current })
       })
       audio.addEventListener('seeked', () => {
+        reportSeek('seeked', { target: pendingSeek })
         pendingSeek = null
         emit({ time: Number(audio.currentTime) || 0, seeking: false })
       })
@@ -523,13 +588,69 @@ window.__ModuleLoader__.load({
         if (Number.isFinite(total) && total > 0) emit({ duration: total })
       })
       audio.addEventListener('ended', () => step(1))
+
+      // ── 坏源自动跳过 ────────────────────────────────────────────────────
+      // 服务端已经做了 3 次断点续传；如果还是拉不动（源本身坏了 / CDN 持续拒绝），
+      // <audio> 会派发 error。这里自动切下一首，不用用户手动点。
+      // 设上限是为了防止「整个网络都断了」时在列表里无限打转。
+      const MAX_AUTO_SKIP = 3
+      const AUTO_SKIP_DELAY_MS = 400
+      let autoSkipCount = 0
+      let autoSkipTimer = null
+
+      function cancelAutoSkip() {
+        if (autoSkipTimer !== null) {
+          clearTimeout(autoSkipTimer)
+          autoSkipTimer = null
+        }
+      }
+
+      function scheduleAutoSkip() {
+        if (state.tracks.length < 2) return
+        if (autoSkipCount >= MAX_AUTO_SKIP) return
+        const failedId = state.current === null ? '' : state.current.bvid
+        cancelAutoSkip()
+        autoSkipCount += 1
+        autoSkipTimer = setTimeout(() => {
+          autoSkipTimer = null
+          // 这 400ms 里用户可能手动换了歌或停了播放，别抢方向盘
+          if (state.current === null || state.current.bvid !== failedId) return
+          step(1)
+        }, AUTO_SKIP_DELAY_MS)
+      }
+
+      audio.addEventListener('playing', () => {
+        // 真的出声了才算这一轮恢复，连败计数清零
+        autoSkipCount = 0
+        cancelAutoSkip()
+      })
+
       audio.addEventListener('error', () => {
-        if (typeof audio.src === 'string' && audio.src.length > 0) emit({ error: 'playFailed' })
+        if (typeof audio.src !== 'string' || audio.src.length === 0) return
+        // code 1 = MEDIA_ERR_ABORTED：是我们主动换源/暂停造成的，不算失败，
+        // 否则切歌时会把自己新设的 src 也当成坏源，白跳一首。
+        if (audio.error !== null && audio.error.code === 1) return
+        // blob: 播不了（页面策略拦 media-src blob:）就退回直连——至少还有声音。
+        if (audio.src.startsWith('blob:') && state.current !== null) {
+          const fallback = state.current.streamUrl
+          if (typeof fallback === 'string' && fallback.length > 0) {
+            reportSeek('blob-fallback', { code: audio.error === null ? 0 : audio.error.code })
+            releaseObjectUrl()
+            audio.src = fallback
+            audio.currentTime = 0
+            const attempt = audio.play()
+            if (attempt !== undefined && typeof attempt.catch === 'function') attempt.catch(() => {})
+            return
+          }
+        }
+        emit({ error: 'playFailed' })
+        scheduleAutoSkip()
       })
       audio.volume = state.volume
 
       function dispose() {
         sequence += 1
+        cancelAutoSkip()
         audio.pause()
         audio.removeAttribute('src')
         try {
@@ -537,6 +658,7 @@ window.__ModuleLoader__.load({
         } catch {
           /* ignore */
         }
+        releaseObjectUrl()
         listeners.clear()
       }
 

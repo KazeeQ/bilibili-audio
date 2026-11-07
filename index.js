@@ -13,10 +13,14 @@
  * Only whitelisted Bilibili-owned hosts may be proxied.
  */
 import { Readable } from 'node:stream'
+import { appendFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 
 export const inject = ['webServer']
 
 const PREFIX = '/bili-audio/api'
+const REPORT_FILE = join(tmpdir(), 'bili-audio-seek.log')
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 const REFERER = 'https://www.bilibili.com'
@@ -202,7 +206,8 @@ async function handleResolve(req, res) {
       duration: Number(data.duration) || 0,
       quality: best.id ?? 0,
       pageCount: Array.isArray(data.pages) ? data.pages.length : 1,
-      // v=2 busts any cached 200 response from before the range fix.
+      // v=2 busts any cached 200 response from before the range fix. Kept
+      // relative: the client fetches these bytes and plays them from a blob: URL.
       streamUrl: `${PREFIX}/stream?u=${token}&v=2`,
     },
   })
@@ -405,9 +410,14 @@ async function handleStream(req, res) {
   const onClose = () => controller.abort()
   res.on('close', onClose)
 
+  const trace = (message) => {
+    appendFile(REPORT_FILE, `${new Date().toISOString()} stream ${message}\n`).catch(() => {})
+  }
+
   try {
     const headers = { 'user-agent': UA, referer: REFERER }
     const range = typeof req.headers.range === 'string' ? req.headers.range.trim() : ''
+    trace(`req method=${req.method} host=${req.headers.host || '-'} range=${range || '-'} ua=${(req.headers['user-agent'] || '-').slice(0, 40)}`)
     let upstreamRange = range
     const suffix = /^bytes=-(\d+)$/.exec(range)
     if (suffix !== null) {
@@ -434,6 +444,9 @@ async function handleStream(req, res) {
 
     const length = upstream.headers.get('content-length')
     const total = length === null ? 0 : Number(length)
+    trace(
+      `upstream status=${upstream.status} length=${length} cr=${upstream.headers.get('content-range') || '-'} ar=${upstream.headers.get('accept-ranges') || '-'} ct=${upstream.headers.get('content-type') || '-'}`,
+    )
 
     // The CDN answers `Range: bytes=0-` with 200 while still advertising a
     // Content-Range. A media element reads that as "this server has no range
@@ -453,6 +466,7 @@ async function handleStream(req, res) {
         'content-range': `bytes ${wanted.start}-${wanted.end}/${total}`,
         'content-length': String(wanted.end - wanted.start + 1),
       })
+      trace(`out 206(sliced) ${wanted.start}-${wanted.end}/${total} cl=${wanted.end - wanted.start + 1}`)
       if (req.method === 'HEAD' || upstream.body === null) {
         res.end()
         if (upstream.body !== null) await upstream.body.cancel().catch(() => {})
@@ -482,6 +496,7 @@ async function handleStream(req, res) {
     if (contentRange !== null) outHeaders['content-range'] = contentRange
 
     res.writeHead(upstream.status, outHeaders)
+    trace(`out ${upstream.status} cl=${outHeaders['content-length'] || '-'} cr=${outHeaders['content-range'] || '-'}`)
     if (req.method === 'HEAD' || upstream.body === null) {
       res.end()
       return
@@ -511,6 +526,106 @@ async function handleStream(req, res) {
   }
 }
 
+const SELFTEST_HTML = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>B站音频 seek 自检</title>
+<style>
+body{font:13px/1.7 ui-monospace,Consolas,monospace;padding:18px;background:#101114;color:#d6d8e0}
+h3{margin:0 0 10px}
+pre{white-space:pre-wrap;background:#181a20;border:1px solid #2b2f3a;border-radius:8px;padding:12px;min-height:240px}
+button{padding:7px 14px;margin:0 6px 10px 0;border-radius:7px;border:1px solid #3a4050;background:#232733;color:#e6e8f0;cursor:pointer}
+audio{display:block;margin:10px 0;width:100%}
+</style></head><body>
+<h3>B站音频 seek 自检</h3>
+<p>先点播放，听几秒，再点下面两个 seek 按钮，然后把整段输出发给我。</p>
+<audio id="a" controls preload="auto"></audio>
+<button id="seek50">seek 到 50%</button>
+<button id="seek10">seek 到第 10 秒</button>
+<button id="reset">清空输出</button>
+<pre id="out"></pre>
+<script>
+var out = document.getElementById('out')
+var a = document.getElementById('a')
+function log(m) { out.textContent += m + String.fromCharCode(10) }
+function state() {
+  var sk = a.seekable
+  var bf = a.buffered
+  return 't=' + a.currentTime.toFixed(2) + ' dur=' + a.duration + ' ready=' + a.readyState +
+    ' seekable=' + sk.length + (sk.length ? '[' + sk.start(0) + ',' + sk.end(0) + ']' : '') +
+    ' buffered=' + (bf.length ? '[' + bf.start(bf.length - 1) + ',' + bf.end(bf.length - 1) + ']' : 'none')
+}
+;['loadedmetadata','canplay','seeking','seeked','waiting','playing','pause','error','stalled'].forEach(function (name) {
+  a.addEventListener(name, function () {
+    if (name === 'stalled') return
+    if (name === 'error') log('[error] code=' + (a.error && a.error.code) + ' msg=' + (a.error && a.error.message))
+    else log('[' + name + '] ' + state())
+  })
+})
+fetch('/bili-audio/api/search?keyword=' + encodeURIComponent('晴天 周杰伦')).then(function (r) { return r.json() }).then(function (s) {
+  var bvid = s.items && s.items[0] ? s.items[0].bvid : ''
+  log('search bvid=' + bvid)
+  return fetch('/bili-audio/api/resolve?raw=' + bvid).then(function (r) { return r.json() })
+}).then(function (r) {
+  log('resolve ok=' + r.ok + ' title=' + (r.track && r.track.title))
+  log('streamUrl=' + (r.track && r.track.streamUrl))
+  a.src = r.track.streamUrl
+}).catch(function (e) { log('fail ' + e) })
+function seekTo(t) {
+  log('--- click seek -> ' + t + '  ' + state())
+  a.currentTime = t
+  log('    set currentTime, immediately ' + state())
+  setTimeout(function () { log('    +1s ' + state()) }, 1000)
+  setTimeout(function () { log('    +3s ' + state()) }, 3000)
+}
+function wait(ms) { return new Promise(function (r) { setTimeout(r, ms) }) }
+async function autoTest() {
+  for (var i = 0; i < 120 && a.readyState < 1; i++) await wait(250)
+  log('A meta: ' + state())
+  try { await a.play(); log('B play ok') } catch (e) { log('B play FAIL ' + e) }
+  await wait(2500)
+  log('C after 2.5s: ' + state())
+  a.currentTime = 60
+  log('D seek->60 set: ' + state())
+  await wait(1200)
+  log('E +1.2s: ' + state())
+  await wait(2000)
+  log('F +3.2s: ' + state())
+  var stream = a.captureStream()
+  log('G captureStream tracks=' + stream.getAudioTracks().length)
+  await wait(700)
+  log('H after capture: ' + state())
+  a.currentTime = 120
+  log('I seek->120 set: ' + state())
+  await wait(1200)
+  log('J +1.2s: ' + state())
+  await wait(2000)
+  log('K +3.2s: ' + state())
+  a.pause()
+  log('DONE')
+}
+if (location.search.indexOf('auto=1') >= 0) {
+  autoTest().catch(function (e) { log('AUTO FAIL ' + e) })
+}
+document.getElementById('seek50').addEventListener('click', function () { seekTo(Math.floor(a.duration / 2) || 30) })
+document.getElementById('seek10').addEventListener('click', function () { seekTo(10) })
+document.getElementById('reset').addEventListener('click', function () { out.textContent = '' })
+</script></body></html>`
+
+/**
+ * The desktop shell serves the UI from `dsh-app://app/`, so a relative media URL
+ * would be resolved against that custom scheme — where byte ranges are not
+ * honoured and the element reports `seekable = [0,0]`. Media must therefore be
+ * pointed at the real HTTP listener (whose Host header the shell forwards).
+ */
+function publicBase(req) {
+  const candidates = [req.headers['x-forwarded-host'], req.headers.host]
+  for (const value of candidates) {
+    if (typeof value === 'string' && /^[A-Za-z0-9.\-]+:\d+$/.test(value.trim())) {
+      return `http://${value.trim()}`
+    }
+  }
+  return ''
+}
+
 async function route(req, res, handler) {
   try {
     await handler(req, res)
@@ -521,6 +636,18 @@ async function route(req, res, handler) {
     }
     sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
   }
+}
+
+/** Diagnostic sink: the client posts seek traces here so they can be inspected on disk. */
+async function handleReport(req, res) {
+  let body = ''
+  try {
+    for await (const chunk of req) body += chunk
+    await appendFile(REPORT_FILE, `${new Date().toISOString()} ${body.slice(0, 4000)}\n`)
+  } catch {
+    /* diagnostics must never break playback */
+  }
+  sendJson(res, 200, { ok: true })
 }
 
 export function apply(ctx) {
@@ -540,10 +667,25 @@ export function apply(ctx) {
       path: `${PREFIX}/stream`,
       handler: (req, res) => route(req, res, handleStream),
     })
+    const disposeSelftest = ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/selftest`,
+      handler: (req, res) => {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+        res.end(SELFTEST_HTML)
+      },
+    })
+    const disposeReport = ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/report`,
+      handler: (req, res) => route(req, res, handleReport),
+    })
     return () => {
       disposeResolve()
       disposeSearch()
       disposeStream()
+      disposeSelftest()
+      disposeReport()
     }
   }, 'bilibili-audio: resolve, search and stream routes')
 }
