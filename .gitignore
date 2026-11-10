@@ -1,6 +1,8 @@
 node_modules/
 *.log
 *.tgz
+*.bak
+*.bak-*
 .DS_Store
 Thumbs.db
 .vscode/

@@ -251,7 +251,7 @@ async function handleSearch(req, res) {
     sendJson(res, 200, { ok: false, error: '先输入要搜的标题关键词' })
     return
   }
-  const page = Math.max(1, Math.min(5, Number(url.searchParams.get('page')) || 1))
+  const page = Math.max(1, Math.min(50, Number(url.searchParams.get('page')) || 1))
   const cacheKey = `${keyword}|${page}`
   const cached = searchCache.get(cacheKey)
   if (cached !== undefined && Date.now() - cached.at < SEARCH_TTL_MS) {
@@ -437,6 +437,7 @@ async function handleStream(req, res) {
 
     const upstream = await fetch(target, { headers, signal: controller.signal })
     if (!upstream.ok && upstream.status !== 206) {
+      trace(`upstream-fail status=${upstream.status}`)
       res.writeHead(upstream.status, { 'content-type': 'text/plain; charset=utf-8' })
       res.end(`B站 音频源返回 ${upstream.status}`)
       return
@@ -649,6 +650,7 @@ async function handleReport(req, res) {
   }
   sendJson(res, 200, { ok: true })
 }
+
 
 export function apply(ctx) {
   ctx.effect(() => {

@@ -19,6 +19,10 @@ window.__ModuleLoader__.load({
     const TRACKS_KEY = 'dsh.bilibili-audio.tracks.v1'
     const LAST_KEY = 'dsh.bilibili-audio.last.v1'
     const VOLUME_KEY = 'dsh.bilibili-audio.volume.v1'
+    const MODE_KEY = 'dsh.bilibili-audio.mode.v1'
+    const SHUFFLE_KEY = 'dsh.bilibili-audio.shuffle.v1'
+    const REPEAT_KEY = 'dsh.bilibili-audio.repeat.v1'
+    const PLAY_MODES = ['list', 'one', 'shuffle']
 
     const zh = {
       meta: {
@@ -61,6 +65,19 @@ window.__ModuleLoader__.load({
       noResults: '没搜到，换个关键词试试',
       plays: '播放',
       results: '条结果',
+      viewList: '列表',
+      viewGrid: '网格',
+      prevPage: '上一页',
+      nextPage: '下一页',
+      pageUnit: '页',
+      approx: '约',
+      shuffle: '随机播放',
+      repeatOne: '单曲循环',
+      playOrder: '顺序播放',
+      searchFavorites: '搜索收藏',
+      searchFavoritesPlaceholder: '在收藏里搜歌名、UP 主或 BV 号',
+      noFavoriteHit: '收藏里没有匹配的歌',
+      importMusic: '导入',
     }
 
     const en = {
@@ -104,6 +121,19 @@ window.__ModuleLoader__.load({
       noResults: 'No results — try another keyword',
       plays: 'plays',
       results: 'results',
+      viewList: 'List',
+      viewGrid: 'Grid',
+      prevPage: 'Previous page',
+      nextPage: 'Next page',
+      pageUnit: '',
+      approx: 'about',
+      shuffle: 'Shuffle',
+      repeatOne: 'Repeat one',
+      playOrder: 'Play in order',
+      searchFavorites: 'Search saved',
+      searchFavoritesPlaceholder: 'Filter by title, uploader or BV id',
+      noFavoriteHit: 'No saved track matches',
+      importMusic: 'Import',
     }
 
     function readTracks() {
@@ -162,6 +192,126 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** One switch, three states: play in order, repeat one, shuffle. */
+    function readMode() {
+      try {
+        const raw = localStorage.getItem(MODE_KEY)
+        if (PLAY_MODES.indexOf(raw) >= 0) return raw
+        if (localStorage.getItem(REPEAT_KEY) === '1') return 'one'
+        if (localStorage.getItem(SHUFFLE_KEY) === '1') return 'shuffle'
+      } catch {
+        /* ignore */
+      }
+      return 'list'
+    }
+
+    function writeMode(value) {
+      try {
+        localStorage.setItem(MODE_KEY, value)
+        localStorage.removeItem(REPEAT_KEY)
+        localStorage.removeItem(SHUFFLE_KEY)
+      } catch {
+        /* ignore */
+      }
+    }
+
+    /**
+     * Imported files live in IndexedDB (blob) while the track list only keeps
+     * metadata, so a page refresh does not lose the audio itself.
+     */
+    const LOCAL_PREFIX = 'local:'
+    const LOCAL_DB = 'dsh-bilibili-audio'
+    const LOCAL_STORE = 'files'
+    const LOCAL_AUDIO_EXT = /\.(mp3|m4a|aac|flac|wav|ogg|oga|opus|webm|weba|mp4)$/i
+
+    function isLocalId(value) {
+      return typeof value === 'string' && value.indexOf(LOCAL_PREFIX) === 0
+    }
+
+    function openLocalDb() {
+      return new Promise((resolve, reject) => {
+        if (typeof indexedDB === 'undefined') {
+          reject(new Error('IndexedDB unavailable'))
+          return
+        }
+        const request = indexedDB.open(LOCAL_DB, 1)
+        request.onupgradeneeded = () => {
+          const db = request.result
+          if (!db.objectStoreNames.contains(LOCAL_STORE)) db.createObjectStore(LOCAL_STORE)
+        }
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error || new Error('IndexedDB open failed'))
+      })
+    }
+
+    async function withLocalStore(mode, run) {
+      const db = await openLocalDb()
+      try {
+        return await new Promise((resolve, reject) => {
+          const tx = db.transaction(LOCAL_STORE, mode)
+          const request = run(tx.objectStore(LOCAL_STORE))
+          let result
+          request.onsuccess = () => {
+            result = request.result
+          }
+          request.onerror = () => reject(request.error)
+          tx.oncomplete = () => resolve(result)
+          tx.onerror = () => reject(tx.error)
+          tx.onabort = () => reject(tx.error || new Error('transaction aborted'))
+        })
+      } finally {
+        db.close()
+      }
+    }
+
+    function putLocalFile(id, file) {
+      return withLocalStore('readwrite', (store) => store.put(file, id))
+    }
+
+    function getLocalFile(id) {
+      return withLocalStore('readonly', (store) => store.get(id))
+    }
+
+    function dropLocalFile(id) {
+      return withLocalStore('readwrite', (store) => store.delete(id))
+    }
+
+    /** Reads the duration without keeping the file open. */
+    function probeDuration(file) {
+      return new Promise((resolve) => {
+        let url = null
+        try {
+          url = URL.createObjectURL(file)
+        } catch {
+          resolve(0)
+          return
+        }
+        const probe = new Audio()
+        let done = false
+        const finish = (value) => {
+          if (done) return
+          done = true
+          try {
+            probe.removeAttribute('src')
+            probe.load()
+          } catch {
+            /* ignore */
+          }
+          try {
+            URL.revokeObjectURL(url)
+          } catch {
+            /* ignore */
+          }
+          resolve(value)
+        }
+        probe.preload = 'metadata'
+        probe.onloadedmetadata = () => finish(Number.isFinite(probe.duration) ? probe.duration : 0)
+        probe.onerror = () => finish(0)
+        setTimeout(() => finish(0), 8000)
+        probe.src = url
+      })
+    }
+
     function formatTime(seconds) {
       const value = Number(seconds)
       if (!Number.isFinite(value) || value < 0) return '0:00'
@@ -201,6 +351,7 @@ window.__ModuleLoader__.load({
         time: 0,
         duration: 0,
         volume: readVolume(),
+        playMode: readMode(),
         loading: false,
         seeking: false,
         error: '',
@@ -242,6 +393,10 @@ window.__ModuleLoader__.load({
       }
 
       let objectUrl = null
+      // Which bvid the <audio> element actually holds. A failed switch updates
+      // state.current before the download lands, so without this the play button
+      // would resume the previous song while the UI shows the new one.
+      let loadedBvid = ''
 
       function releaseObjectUrl() {
         if (objectUrl === null) return
@@ -253,9 +408,48 @@ window.__ModuleLoader__.load({
         objectUrl = null
       }
 
+      /**
+       * Pulls the whole audio file. Bilibili's signed URL can be rejected after
+       * a while (or under load), so a failure re-resolves the track once and
+       * retries with a freshly signed URL before giving up.
+       */
+      async function downloadAudio(track, mine) {
+        let url = track.streamUrl
+        let lastError = null
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          if (mine !== sequence) throw new Error('cancelled')
+          try {
+            const data = await fetch(url, { cache: 'no-store' })
+            if (!data.ok) throw new Error(`HTTP ${data.status}`)
+            const buffer = await data.arrayBuffer()
+            if (buffer.byteLength === 0) throw new Error('empty body')
+            return buffer
+          } catch (error) {
+            lastError = error
+            if (attempt === 0) {
+              try {
+                const again = await fetch(`${API}resolve?raw=${encodeURIComponent(track.bvid)}`)
+                const payload = await again.json()
+                if (payload && payload.ok === true && payload.track && typeof payload.track.streamUrl === 'string') {
+                  url = payload.track.streamUrl
+                }
+              } catch {
+                /* keep the old URL */
+              }
+              await new Promise((resolve) => setTimeout(resolve, 400))
+            }
+          }
+        }
+        throw lastError === null ? new Error('download failed') : lastError
+      }
+
       async function open(raw) {
         const value = String(raw ?? '').trim()
         if (value === '') return
+        if (isLocalId(value)) {
+          await openLocal(value)
+          return
+        }
         const mine = ++sequence
         emit({ loading: true, error: '' })
         try {
@@ -282,15 +476,13 @@ window.__ModuleLoader__.load({
           // not honour byte ranges — a media element pointed at it reports
           // `seekable = [0,0]` and refuses every seek. Pulling the bytes through
           // fetch and handing the element a blob: URL keeps seeking local.
-          const data = await fetch(track.streamUrl)
-          if (mine !== sequence) return
-          if (!data.ok) throw new Error(`音频下载失败 HTTP ${data.status}`)
-          const buffer = await data.arrayBuffer()
+          const buffer = await downloadAudio(track, mine)
           if (mine !== sequence) return
           releaseObjectUrl()
           objectUrl = URL.createObjectURL(new Blob([buffer], { type: 'audio/mp4' }))
           audio.src = objectUrl
           audio.currentTime = 0
+          loadedBvid = track.bvid
           emit({ loading: false, time: 0, seeking: false })
           ensureAnalyser()
           const attempt = audio.play()
@@ -303,9 +495,100 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** Plays a file imported from disk, straight out of IndexedDB. */
+      async function openLocal(id) {
+        const mine = ++sequence
+        emit({ loading: true, error: '' })
+        try {
+          const file = await getLocalFile(id)
+          if (mine !== sequence) return
+          if (file === null || file === undefined) {
+            emit({ loading: false, error: '本地文件不见了，请重新导入' })
+            return
+          }
+          const entry = state.tracks.find((item) => item.bvid === id)
+          const blob = file instanceof Blob ? file : new Blob([file])
+          const track = {
+            bvid: id,
+            title: entry === undefined ? '本地音乐' : entry.title,
+            owner: entry === undefined || entry.owner === undefined ? '本地音乐' : entry.owner,
+            cover: entry === undefined || typeof entry.cover !== 'string' ? '' : entry.cover,
+            duration: entry === undefined ? 0 : Number(entry.duration) || 0,
+            pageCount: 1,
+            quality: null,
+            streamUrl: '',
+          }
+          pendingSeek = null
+          releaseObjectUrl()
+          objectUrl = URL.createObjectURL(blob)
+          audio.src = objectUrl
+          audio.currentTime = 0
+          loadedBvid = id
+          writeLast(id)
+          emit({
+            current: track,
+            duration: track.duration,
+            time: 0,
+            loading: false,
+            seeking: false,
+            error: '',
+          })
+          ensureAnalyser()
+          const attempt = audio.play()
+          if (attempt !== undefined && typeof attempt.catch === 'function') {
+            attempt.catch(() => emit({ playing: false }))
+          }
+        } catch (cause) {
+          if (mine !== sequence) return
+          emit({ loading: false, error: String((cause && cause.message) || cause) })
+        }
+      }
+
+      /** Saves picked files to IndexedDB and appends them to the saved list. */
+      async function importFiles(files) {
+        const list = Array.from(files || [])
+        if (list.length === 0) return
+        let added = 0
+        for (let i = 0; i < list.length; i += 1) {
+          const file = list[i]
+          if (file === null || typeof file !== 'object') continue
+          const name = typeof file.name === 'string' ? file.name : ''
+          const type = typeof file.type === 'string' ? file.type : ''
+          if (type.indexOf('audio/') !== 0 && LOCAL_AUDIO_EXT.test(name) === false) continue
+          const id = `${LOCAL_PREFIX}${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+          let duration = 0
+          try {
+            duration = await probeDuration(file)
+          } catch {
+            duration = 0
+          }
+          try {
+            await putLocalFile(id, file)
+          } catch {
+            emit({ error: '本地文件保存失败' })
+            continue
+          }
+          rememberTrack({
+            bvid: id,
+            title: name.replace(/\.[^.]+$/, '') || name,
+            owner: '本地音乐',
+            cover: '',
+            duration,
+          })
+          added += 1
+        }
+        if (added === 0) emit({ error: '没有可导入的音频文件' })
+      }
+
       function toggle() {
         if (state.current === null) {
           if (state.tracks.length > 0) open(state.tracks[0].bvid)
+          return
+        }
+        // The element still holds the previous song (that switch failed), so
+        // "play" must retry the song the UI is showing instead of resuming it.
+        if (loadedBvid !== state.current.bvid) {
+          if (!state.loading) open(state.current.bvid)
           return
         }
         if (audio.paused) {
@@ -319,11 +602,26 @@ window.__ModuleLoader__.load({
 
       function step(delta) {
         if (state.tracks.length === 0) return
+        if (delta > 0 && state.playMode === 'shuffle') {
+          const pool = state.tracks.filter((item) => state.current === null || item.bvid !== state.current.bvid)
+          const list = pool.length > 0 ? pool : state.tracks
+          const picked = list[Math.floor(Math.random() * list.length)]
+          if (picked !== undefined) open(picked.bvid)
+          return
+        }
         const activeId = state.current === null ? '' : state.current.bvid
         const index = state.tracks.findIndex((item) => item.bvid === activeId)
         const nextIndex = index < 0 ? 0 : (index + delta + state.tracks.length) % state.tracks.length
         const target = state.tracks[nextIndex]
         if (target !== undefined) open(target.bvid)
+      }
+
+      /** Cycles 顺序 → 单曲 → 随机 → 顺序 and remembers the choice. */
+      function cycleMode() {
+        const index = PLAY_MODES.indexOf(state.playMode)
+        const next = PLAY_MODES[(index < 0 ? 0 : index + 1) % PLAY_MODES.length]
+        writeMode(next)
+        emit({ playMode: next })
       }
 
       const reportSeek = (tag, extra) => {
@@ -407,6 +705,9 @@ window.__ModuleLoader__.load({
       function remove(bvid) {
         const next = state.tracks.filter((item) => item.bvid !== bvid)
         writeTracks(next)
+        if (isLocalId(bvid)) {
+          dropLocalFile(bvid).catch(() => {})
+        }
         const isCurrent = state.current !== null && state.current.bvid === bvid
         emit({ tracks: next })
         if (isCurrent) stop()
@@ -414,12 +715,12 @@ window.__ModuleLoader__.load({
 
       function stop() {
         sequence += 1
-        cancelAutoSkip()
         pendingSeek = null
         audio.pause()
         audio.removeAttribute('src')
         audio.load()
         releaseObjectUrl()
+        loadedBvid = ''
         writeLast('')
         emit({ current: null, playing: false, time: 0, duration: 0, seeking: false, error: '' })
       }
@@ -587,49 +888,17 @@ window.__ModuleLoader__.load({
         const total = Number(audio.duration)
         if (Number.isFinite(total) && total > 0) emit({ duration: total })
       })
-      audio.addEventListener('ended', () => step(1))
-
-      // ── 坏源自动跳过 ────────────────────────────────────────────────────
-      // 服务端已经做了 3 次断点续传；如果还是拉不动（源本身坏了 / CDN 持续拒绝），
-      // <audio> 会派发 error。这里自动切下一首，不用用户手动点。
-      // 设上限是为了防止「整个网络都断了」时在列表里无限打转。
-      const MAX_AUTO_SKIP = 3
-      const AUTO_SKIP_DELAY_MS = 400
-      let autoSkipCount = 0
-      let autoSkipTimer = null
-
-      function cancelAutoSkip() {
-        if (autoSkipTimer !== null) {
-          clearTimeout(autoSkipTimer)
-          autoSkipTimer = null
+      audio.addEventListener('ended', () => {
+        if (state.playMode === 'one') {
+          audio.currentTime = 0
+          const attempt = audio.play()
+          if (attempt !== undefined && typeof attempt.catch === 'function') attempt.catch(() => {})
+          return
         }
-      }
-
-      function scheduleAutoSkip() {
-        if (state.tracks.length < 2) return
-        if (autoSkipCount >= MAX_AUTO_SKIP) return
-        const failedId = state.current === null ? '' : state.current.bvid
-        cancelAutoSkip()
-        autoSkipCount += 1
-        autoSkipTimer = setTimeout(() => {
-          autoSkipTimer = null
-          // 这 400ms 里用户可能手动换了歌或停了播放，别抢方向盘
-          if (state.current === null || state.current.bvid !== failedId) return
-          step(1)
-        }, AUTO_SKIP_DELAY_MS)
-      }
-
-      audio.addEventListener('playing', () => {
-        // 真的出声了才算这一轮恢复，连败计数清零
-        autoSkipCount = 0
-        cancelAutoSkip()
+        step(1)
       })
-
       audio.addEventListener('error', () => {
         if (typeof audio.src !== 'string' || audio.src.length === 0) return
-        // code 1 = MEDIA_ERR_ABORTED：是我们主动换源/暂停造成的，不算失败，
-        // 否则切歌时会把自己新设的 src 也当成坏源，白跳一首。
-        if (audio.error !== null && audio.error.code === 1) return
         // blob: 播不了（页面策略拦 media-src blob:）就退回直连——至少还有声音。
         if (audio.src.startsWith('blob:') && state.current !== null) {
           const fallback = state.current.streamUrl
@@ -644,13 +913,11 @@ window.__ModuleLoader__.load({
           }
         }
         emit({ error: 'playFailed' })
-        scheduleAutoSkip()
       })
       audio.volume = state.volume
 
       function dispose() {
         sequence += 1
-        cancelAutoSkip()
         audio.pause()
         audio.removeAttribute('src')
         try {
@@ -715,12 +982,31 @@ window.__ModuleLoader__.load({
         }
       }
 
-      return { subscribe, getSnapshot, open, toggle, step, seek, setVolume, remove, stop, dispose, energy, spectrum, debug }
+      return {
+        subscribe,
+        getSnapshot,
+        open,
+        toggle,
+        step,
+        seek,
+        setVolume,
+        remove,
+        stop,
+        dispose,
+        energy,
+        spectrum,
+        debug,
+        cycleMode,
+        importFiles,
+      }
     }
 
     const CSS = `
-.bili-audio-page{height:100%;min-height:100%;box-sizing:border-box;overflow-y:auto;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);}
-.bili-audio-inner{box-sizing:border-box;max-width:880px;margin:0 auto;padding:28px 32px 72px;display:flex;flex-direction:column;gap:22px;}
+.bili-audio-page{height:100%;min-height:100%;box-sizing:border-box;display:flex;flex-direction:column;overflow:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);}
+.bili-audio-scroll{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;}
+.bili-audio-inner{box-sizing:border-box;width:100%;max-width:880px;margin:0 auto;padding:28px 32px 28px;display:flex;flex-direction:column;gap:22px;}
+.bili-audio-dock{flex:none;border-top:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base);padding:12px 32px 16px;box-sizing:border-box;}
+.bili-audio-dock-inner{width:100%;max-width:816px;margin:0 auto;}
 .bili-audio-head{display:flex;flex-direction:column;gap:6px;}
 .bili-audio-title{font-size:22px;font-weight:600;line-height:1.3;margin:0;}
 .bili-audio-sub{font-size:13px;color:var(--dsw-alias-label-secondary);margin:0;line-height:1.5;}
@@ -729,7 +1015,25 @@ window.__ModuleLoader__.load({
 .bili-audio-mode-btn{border:none;background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1;height:32px;padding:0 10px;border-radius:7px;cursor:pointer;white-space:nowrap;font-family:inherit;}
 .bili-audio-mode-btn:hover{color:var(--dsw-alias-label-primary);}
 .bili-audio-mode-btn.is-on{background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-weight:500;}
-.bili-audio-results{display:flex;flex-direction:column;gap:4px;max-height:372px;overflow-y:auto;padding:6px;border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:var(--dsw-alias-bg-layer-1);}
+.bili-audio-results{display:flex;flex-direction:column;gap:6px;padding:6px;border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:var(--dsw-alias-bg-layer-1);}
+.bili-audio-results-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:2px 4px 0;}
+.bili-audio-results-info{font-size:11.5px;color:var(--dsw-alias-label-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.bili-audio-results-tools{display:flex;align-items:center;gap:4px;flex:none;}
+.bili-audio-pager{width:24px;height:24px;border:none;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:15px;line-height:1;display:flex;align-items:center;justify-content:center;padding:0;}
+.bili-audio-pager:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);}
+.bili-audio-pager:disabled{opacity:.35;cursor:default;}
+.bili-audio-pager-label{font-size:11.5px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;min-width:40px;text-align:center;}
+.bili-audio-viewswitch{padding:2px;border-radius:8px;}
+.bili-audio-viewswitch .bili-audio-mode-btn{height:24px;font-size:11.5px;padding:0 8px;border-radius:6px;}
+.bili-audio-results-body{display:flex;flex-direction:column;gap:4px;max-height:340px;overflow-y:auto;}
+.bili-audio-results-body.is-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:8px;max-height:396px;align-content:start;}
+.bili-audio-card{display:flex;flex-direction:column;gap:5px;padding:5px;border:none;border-radius:10px;background:transparent;color:inherit;cursor:pointer;text-align:left;font:inherit;min-width:0;}
+.bili-audio-card:hover{background:var(--dsw-alias-bg-layer-2);}
+.bili-audio-card-cover{position:relative;width:100%;aspect-ratio:16/10;border-radius:8px;overflow:hidden;background:var(--dsw-alias-bg-layer-2);display:flex;align-items:center;justify-content:center;color:var(--dsw-alias-label-secondary);}
+.bili-audio-card-cover img{width:100%;height:100%;object-fit:cover;display:block;}
+.bili-audio-card-duration{position:absolute;right:5px;bottom:5px;font-size:10px;line-height:1.5;padding:0 4px;border-radius:4px;background:rgba(0,0,0,.62);color:#fff;font-variant-numeric:tabular-nums;}
+.bili-audio-card-title{font-size:12px;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;}
+.bili-audio-card-meta{font-size:10.5px;color:var(--dsw-alias-label-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .bili-audio-result{display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:9px;border:none;background:transparent;color:inherit;cursor:pointer;text-align:left;width:100%;font:inherit;}
 .bili-audio-result:hover{background:var(--dsw-alias-bg-layer-2);}
 .bili-audio-result-cover{width:52px;height:34px;border-radius:6px;overflow:hidden;background:var(--dsw-alias-bg-layer-2);flex:none;display:flex;align-items:center;justify-content:center;color:var(--dsw-alias-label-secondary);}
@@ -753,13 +1057,35 @@ window.__ModuleLoader__.load({
 .bili-audio-row{display:flex;align-items:center;gap:12px;margin-top:6px;}
 .bili-audio-play{width:40px;height:40px;flex:none;border-radius:50%;border:none;background:var(--dsw-alias-brand-primary);color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;}
 .bili-audio-play svg{display:block;}
+.bili-audio-skip{width:36px;height:36px;flex:none;border:none;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;border-radius:50%;transition:background-color .15s ease,color .15s ease,transform .15s ease;}
+.bili-audio-skip:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);}
+.bili-audio-skip:active{transform:scale(.92);}
+.bili-audio-skip svg{display:block;}
 .bili-audio-progress{flex:1;min-width:0;display:flex;align-items:center;}
 .bili-audio-time{font-size:11px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;white-space:nowrap;}
 .bili-audio-vol{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary);}
+.bili-audio-toggle{width:28px;height:28px;border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;}
+.bili-audio-toggle:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);}
+.bili-audio-toggle.is-on{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2);}
 .bili-audio-list{display:flex;flex-direction:column;gap:10px;}
-.bili-audio-list-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;}
-.bili-audio-list-title{font-size:14px;font-weight:600;margin:0;}
-.bili-audio-list-count{font-size:12px;color:var(--dsw-alias-label-secondary);}
+.bili-audio-list-head{display:flex;align-items:center;gap:8px;}
+.bili-audio-list-tools{display:flex;align-items:center;gap:8px;flex:none;}
+.bili-audio-iconbtn{width:26px;height:26px;border:none;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;flex:none;transition:transform .15s ease,background-color .15s ease,color .15s ease;}
+.bili-audio-iconbtn:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);}
+.bili-audio-iconbtn:active{transform:scale(.93);}
+.bili-audio-iconbtn.is-on{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2);}
+.bili-audio-list-search{flex:0 0 auto;width:0;min-width:0;opacity:0;overflow:hidden;pointer-events:none;transition:width .28s cubic-bezier(.4,0,.2,1),opacity .18s ease;}
+.bili-audio-list-search.is-open{width:min(232px,42vw);opacity:1;pointer-events:auto;}
+.bili-audio-list-search-inner{position:relative;width:100%;min-width:0;display:flex;align-items:center;transform:translateX(-10px) scale(.97);opacity:.4;transition:transform .28s cubic-bezier(.4,0,.2,1),opacity .2s ease;}
+.bili-audio-list-search.is-open .bili-audio-list-search-inner{transform:translateX(0) scale(1);opacity:1;}
+.bili-audio-input-sm{height:32px;font-size:12.5px;padding:0 14px;border-radius:999px;flex:1;min-width:0;}
+.bili-audio-list-title{font-size:14px;font-weight:600;margin:0;flex:none;}
+.bili-audio-list-count{font-size:12px;color:var(--dsw-alias-label-secondary);flex:none;white-space:nowrap;}
+.bili-audio-list-tail{display:flex;align-items:center;gap:8px;margin-left:auto;flex:none;}
+.bili-audio-import{display:flex;align-items:center;gap:4px;height:24px;padding:0 9px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);background:transparent;color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:1;cursor:pointer;font-family:inherit;transition:background-color .15s ease,color .15s ease,border-color .15s ease;}
+.bili-audio-import:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2);}
+.bili-audio-import-plus{font-size:13px;line-height:1;}
+.bili-audio-file{display:none;}
 .bili-audio-items{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px;}
 .bili-audio-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;border:1px solid transparent;}
 .bili-audio-item:hover{background:var(--dsw-alias-bg-layer-1);}
@@ -788,7 +1114,7 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
   80%{transform:translate(-50%,0) scale(.982,.99);}
   100%{opacity:1;transform:translate(-50%,0) scale(1);}
 }
-@media (prefers-reduced-motion:reduce){.bili-audio-mini{animation:none;}.bili-audio-mini::after{animation:none;}}
+@media (prefers-reduced-motion:reduce){.bili-audio-mini{animation:none;}.bili-audio-mini::after{animation:none;}.bili-audio-list-search,.bili-audio-list-search-inner,.bili-audio-iconbtn{transition:none;}.bili-audio-iconbtn:active{transform:none;}}
 .bili-audio-mini:hover::before{background:var(--dsw-alias-bg-layer-2);}
 .bili-audio-mini-main{display:flex;align-items:center;gap:8px;min-width:0;background:none;border:none;color:inherit;cursor:pointer;padding:0;font:inherit;text-align:left;}
 .bili-audio-mini-cover{width:26px;height:26px;border-radius:7px;overflow:hidden;background:var(--dsw-alias-bg-layer-1);flex:none;display:flex;align-items:center;justify-content:center;color:var(--dsw-alias-label-secondary);}
@@ -826,6 +1152,27 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
       )
     }
 
+    /** Outline skip-next glyph for the docked player. */
+    function IconSkipNext({ size = 18 }) {
+      return h(
+        'svg',
+        {
+          width: size,
+          height: size,
+          viewBox: '0 0 24 24',
+          'aria-hidden': 'true',
+          focusable: 'false',
+          fill: 'none',
+          stroke: 'currentColor',
+          'stroke-width': 1.7,
+          'stroke-linecap': 'round',
+          'stroke-linejoin': 'round',
+        },
+        h('path', { d: 'M6.2 5.6 15 12l-8.8 6.4Z' }),
+        h('path', { d: 'M18 5.6v12.8' }),
+      )
+    }
+
     function IconClose({ size = 13 }) {
       return h(
         'svg',
@@ -855,6 +1202,79 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
           'stroke-width': 1.8,
           'stroke-linecap': 'round',
         }),
+      )
+    }
+
+    function IconSearch({ size = 15 }) {
+      return h(
+        'svg',
+        {
+          width: size,
+          height: size,
+          viewBox: '0 0 24 24',
+          'aria-hidden': 'true',
+          focusable: 'false',
+          fill: 'none',
+          stroke: 'currentColor',
+          'stroke-width': 2,
+          'stroke-linecap': 'round',
+        },
+        h('circle', { cx: 11, cy: 11, r: 8 }),
+        h('path', { d: 'm20.5 20.5-4.2-4.2' }),
+      )
+    }
+
+    function IconShuffle({ size = 15 }) {
+      return h(
+        'svg',
+        {
+          width: size,
+          height: size,
+          viewBox: '0 0 24 24',
+          'aria-hidden': 'true',
+          focusable: 'false',
+          fill: 'none',
+          stroke: 'currentColor',
+          'stroke-width': 1.9,
+          'stroke-linecap': 'round',
+          'stroke-linejoin': 'round',
+        },
+        h('path', { d: 'M16 3h5v5' }),
+        h('path', { d: 'M3.5 20.5 21 3' }),
+        h('path', { d: 'M21 16v5h-5' }),
+        h('path', { d: 'm15.5 15.5 5.5 5.5' }),
+        h('path', { d: 'm3.5 3.5 5 5' }),
+      )
+    }
+
+    function IconRepeat({ size = 15, one = false }) {
+      return h(
+        'svg',
+        {
+          width: size,
+          height: size,
+          viewBox: '0 0 24 24',
+          'aria-hidden': 'true',
+          focusable: 'false',
+          fill: 'none',
+          stroke: 'currentColor',
+          'stroke-width': 1.9,
+          'stroke-linecap': 'round',
+          'stroke-linejoin': 'round',
+        },
+        h('path', { d: 'm17 2 4 4-4 4' }),
+        h('path', { d: 'M3 11V9a4 4 0 0 1 4-4h14' }),
+        h('path', { d: 'm7 22-4-4 4-4' }),
+        h('path', { d: 'M21 13v2a4 4 0 0 1-4 4H3' }),
+        one === true
+          ? h('path', {
+              d: 'M11.4 9.6 12.6 9v5.2',
+              fill: 'none',
+              stroke: 'currentColor',
+              'stroke-width': 1.9,
+              'stroke-linecap': 'round',
+            })
+          : null,
       )
     }
 
@@ -1100,21 +1520,39 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
       const t = typeof props.t === 'function' ? props.t : (key) => key
       const player = props.player
       const state = usePlayer(player)
-      const { tracks, current, playing, time, loading, volume } = state
+      const { tracks, current, playing, time, loading, volume, playMode } = state
 
       const [input, setInput] = React.useState('')
       const [mode, setMode] = React.useState('bv')
+      const [view, setView] = React.useState('list')
       const [results, setResults] = React.useState(null)
       const [searching, setSearching] = React.useState(false)
       const [localError, setLocalError] = React.useState('')
+      const [keyword, setKeyword] = React.useState('')
+      const [page, setPage] = React.useState(1)
+      const [total, setTotal] = React.useState(0)
+      const [listOpen, setListOpen] = React.useState(false)
+      const [listQuery, setListQuery] = React.useState('')
+      const listInputRef = React.useRef(null)
+      const fileInputRef = React.useRef(null)
+
+      function toggleListSearch() {
+        const next = !listOpen
+        setListOpen(next)
+        if (!next) setListQuery('')
+      }
+
+      React.useEffect(() => {
+        if (listOpen && listInputRef.current !== null) listInputRef.current.focus()
+      }, [listOpen])
 
       const error = localError.length > 0 ? localError : state.error === 'playFailed' ? t('playFailed') : state.error
 
-      async function search(keyword) {
+      async function search(word, pageNumber) {
         setSearching(true)
         setLocalError('')
         try {
-          const response = await fetch(`${API}search?keyword=${encodeURIComponent(keyword)}`)
+          const response = await fetch(`${API}search?keyword=${encodeURIComponent(word)}&page=${pageNumber}`)
           const payload = await response.json()
           if (payload === null || payload.ok !== true) {
             setResults(null)
@@ -1122,12 +1560,21 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
             return
           }
           setResults(Array.isArray(payload.items) ? payload.items : [])
+          setKeyword(word)
+          setPage(Number(payload.page) || pageNumber)
+          setTotal(Number(payload.total) || 0)
         } catch (cause) {
           setResults(null)
           setLocalError(String((cause && cause.message) || cause))
         } finally {
           setSearching(false)
         }
+      }
+
+      function goPage(next) {
+        const value = Number(next)
+        if (!Number.isFinite(value) || value < 1 || value === page || searching) return
+        search(keyword, value)
       }
 
       function switchMode(next) {
@@ -1146,7 +1593,7 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
         }
         setInput('')
         if (mode === 'title') {
-          search(value)
+          search(value, 1)
           return
         }
         player.open(value)
@@ -1158,6 +1605,7 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
 
       const duration = current !== null && Number(current.duration) > 0 ? Number(current.duration) : 0
       const currentId = current === null ? '' : current.bvid
+      const totalPages = Math.max(1, Math.min(50, Math.ceil(total / 20) || 1))
 
       // Scrubbing. The slider is deliberately *uncontrolled*: the browser owns
       // its value while the thumb is held, so no React re-render (timeupdate,
@@ -1226,6 +1674,8 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
               ? ''
               : t('paused')
 
+      const modeLabel = t(playMode === 'shuffle' ? 'shuffle' : playMode === 'one' ? 'repeatOne' : 'playOrder')
+
       const nowTitle = current === null ? t('nothing') : current.title || current.bvid
       const nowSub =
         current === null
@@ -1264,6 +1714,17 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
                     playing ? h(IconPause) : h(IconPlay),
                   ),
                   h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'bili-audio-skip',
+                      onClick: () => player.step(1),
+                      title: t('next'),
+                      'aria-label': t('next'),
+                    },
+                    h(IconSkipNext, { size: 18 }),
+                  ),
+                  h(
                     'div',
                     { className: 'bili-audio-progress' },
                     h('input', {
@@ -1285,6 +1746,19 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
                   ),
                   h('span', { className: 'bili-audio-time' }, `${formatTime(shownTime)} / ${formatTime(duration)}`),
                   h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: `bili-audio-toggle${playMode !== 'list' ? ' is-on' : ''}`,
+                      onClick: player.cycleMode,
+                      title: modeLabel,
+                      'aria-label': modeLabel,
+                    },
+                    playMode === 'shuffle'
+                      ? h(IconShuffle, { size: 15 })
+                      : h(IconRepeat, { size: 15, one: playMode === 'one' }),
+                  ),
+                  h(
                     'div',
                     { className: 'bili-audio-vol' },
                     h(IconVolume),
@@ -1304,6 +1778,15 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
               ),
             )
 
+      const listNeedle = listQuery.trim().toLowerCase()
+      const visibleTracks =
+        listNeedle === ''
+          ? tracks
+          : tracks.filter((track) => {
+              const haystack = `${track.title || ''} ${track.owner || ''} ${track.bvid || ''}`.toLowerCase()
+              return haystack.indexOf(listNeedle) >= 0
+            })
+
       const list =
         tracks.length === 0
           ? h(
@@ -1312,10 +1795,12 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
               h('strong', null, t('emptyTitle')),
               h('span', null, t('emptyBody')),
             )
-          : h(
-              'ul',
-              { className: 'bili-audio-items' },
-              tracks.map((track) =>
+          : visibleTracks.length === 0
+            ? h('div', { className: 'bili-audio-hint' }, t('noFavoriteHit'))
+            : h(
+                'ul',
+                { className: 'bili-audio-items' },
+                visibleTracks.map((track) =>
                 h(
                   'li',
                   {
@@ -1344,7 +1829,7 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
                       h(
                         'span',
                         { className: 'bili-audio-item-sub' },
-                        [track.bvid, track.owner, formatTime(track.duration)].filter((part) => part && part.length > 0).join(' · '),
+                        [isLocalId(track.bvid) ? '' : track.bvid, track.owner, formatTime(track.duration)].filter((part) => part && part.length > 0).join(' · '),
                       ),
                     ),
                   ),
@@ -1369,7 +1854,10 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
         h('style', null, CSS),
         h(
           'div',
-          { className: 'bili-audio-inner' },
+          { className: 'bili-audio-scroll' },
+          h(
+            'div',
+            { className: 'bili-audio-inner' },
           h(
             'header',
             { className: 'bili-audio-head', 'data-window-drag': true },
@@ -1432,45 +1920,141 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
             : h(
                 'section',
                 { className: 'bili-audio-results', 'aria-label': t('search') },
-                results.length === 0
-                  ? h('div', { className: 'bili-audio-hint' }, t('noResults'))
-                  : results.map((item) =>
+                h(
+                  'div',
+                  { className: 'bili-audio-results-head' },
+                  h(
+                    'span',
+                    { className: 'bili-audio-results-info' },
+                    total > 0 ? `${t('approx')} ${formatPlay(total)} ${t('results')}` : t('noResults'),
+                  ),
+                  h(
+                    'div',
+                    { className: 'bili-audio-results-tools' },
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'bili-audio-pager',
+                        onClick: () => goPage(page - 1),
+                        disabled: page <= 1 || searching,
+                        title: t('prevPage'),
+                        'aria-label': t('prevPage'),
+                      },
+                      '‹',
+                    ),
+                    h('span', { className: 'bili-audio-pager-label' }, `${page} / ${totalPages}`),
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'bili-audio-pager',
+                        onClick: () => goPage(page + 1),
+                        disabled: page >= totalPages || searching,
+                        title: t('nextPage'),
+                        'aria-label': t('nextPage'),
+                      },
+                      '›',
+                    ),
+                    h(
+                      'div',
+                      { className: 'bili-audio-mode bili-audio-viewswitch', role: 'group' },
                       h(
                         'button',
                         {
-                          key: item.bvid,
                           type: 'button',
-                          className: 'bili-audio-result',
-                          onClick: () => openTrack(item.bvid),
-                          title: item.title,
+                          className: `bili-audio-mode-btn${view === 'list' ? ' is-on' : ''}`,
+                          onClick: () => setView('list'),
+                          'aria-pressed': view === 'list',
+                          title: t('viewList'),
                         },
-                        h(
-                          'div',
-                          { className: 'bili-audio-result-cover' },
-                          typeof item.cover === 'string' && item.cover.length > 0
-                            ? h('img', { src: item.cover, alt: '', loading: 'lazy' })
-                            : h(IconNote, { size: 16 }),
-                        ),
-                        h(
-                          'div',
-                          { className: 'bili-audio-result-body' },
-                          h('span', { className: 'bili-audio-result-title' }, item.title || item.bvid),
-                          h(
-                            'span',
-                            { className: 'bili-audio-result-meta' },
-                            [
-                              item.owner,
-                              item.duration > 0 ? formatTime(item.duration) : '',
-                              item.play > 0 ? `${formatPlay(item.play)} ${t('plays')}` : '',
-                            ]
-                              .filter((part) => typeof part === 'string' && part.length > 0)
-                              .join(' · '),
-                          ),
-                        ),
+                        t('viewList'),
+                      ),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: `bili-audio-mode-btn${view === 'grid' ? ' is-on' : ''}`,
+                          onClick: () => setView('grid'),
+                          'aria-pressed': view === 'grid',
+                          title: t('viewGrid'),
+                        },
+                        t('viewGrid'),
                       ),
                     ),
+                  ),
+                ),
+                h(
+                  'div',
+                  { className: `bili-audio-results-body${view === 'grid' ? ' is-grid' : ''}` },
+                  results.length === 0
+                    ? h('div', { className: 'bili-audio-hint' }, t('noResults'))
+                    : results.map((item) =>
+                        view === 'grid'
+                          ? h(
+                              'button',
+                              {
+                                key: item.bvid,
+                                type: 'button',
+                                className: 'bili-audio-card',
+                                onClick: () => openTrack(item.bvid),
+                                title: item.title,
+                              },
+                              h(
+                                'div',
+                                { className: 'bili-audio-card-cover' },
+                                typeof item.cover === 'string' && item.cover.length > 0
+                                  ? h('img', { src: item.cover, alt: '', loading: 'lazy' })
+                                  : h(IconNote, { size: 18 }),
+                                item.duration > 0
+                                  ? h('span', { className: 'bili-audio-card-duration' }, formatTime(item.duration))
+                                  : null,
+                              ),
+                              h('span', { className: 'bili-audio-card-title' }, item.title || item.bvid),
+                              h(
+                                'span',
+                                { className: 'bili-audio-card-meta' },
+                                [item.owner, item.play > 0 ? `${formatPlay(item.play)} ${t('plays')}` : '']
+                                  .filter((part) => typeof part === 'string' && part.length > 0)
+                                  .join(' · '),
+                              ),
+                            )
+                          : h(
+                              'button',
+                              {
+                                key: item.bvid,
+                                type: 'button',
+                                className: 'bili-audio-result',
+                                onClick: () => openTrack(item.bvid),
+                                title: item.title,
+                              },
+                              h(
+                                'div',
+                                { className: 'bili-audio-result-cover' },
+                                typeof item.cover === 'string' && item.cover.length > 0
+                                  ? h('img', { src: item.cover, alt: '', loading: 'lazy' })
+                                  : h(IconNote, { size: 16 }),
+                              ),
+                              h(
+                                'div',
+                                { className: 'bili-audio-result-body' },
+                                h('span', { className: 'bili-audio-result-title' }, item.title || item.bvid),
+                                h(
+                                  'span',
+                                  { className: 'bili-audio-result-meta' },
+                                  [
+                                    item.owner,
+                                    item.duration > 0 ? formatTime(item.duration) : '',
+                                    item.play > 0 ? `${formatPlay(item.play)} ${t('plays')}` : '',
+                                  ]
+                                    .filter((part) => typeof part === 'string' && part.length > 0)
+                                    .join(' · '),
+                                ),
+                              ),
+                            ),
+                      ),
+                ),
               ),
-          playerCard,
           h(
             'section',
             { className: 'bili-audio-list' },
@@ -1478,10 +2062,83 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
               'div',
               { className: 'bili-audio-list-head' },
               h('h2', { className: 'bili-audio-list-title' }, t('favorites')),
-              h('span', { className: 'bili-audio-list-count' }, `${tracks.length} ${t('count')}`),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: `bili-audio-iconbtn${listOpen ? ' is-on' : ''}`,
+                  onClick: toggleListSearch,
+                  title: t('searchFavorites'),
+                  'aria-label': t('searchFavorites'),
+                  'aria-expanded': listOpen,
+                },
+                h(IconSearch, { size: 15 }),
+              ),
+              h(
+                'div',
+                { className: `bili-audio-list-search${listOpen ? ' is-open' : ''}` },
+                h(
+                  'div',
+                  { className: 'bili-audio-list-search-inner' },
+                  h('input', {
+                    type: 'text',
+                    ref: listInputRef,
+                    className: 'bili-audio-input bili-audio-input-sm',
+                    value: listQuery,
+                    placeholder: t('searchFavoritesPlaceholder'),
+                    onChange: (event) => setListQuery(event.target.value),
+                    onKeyDown: (event) => {
+                      if (event.key === 'Escape') {
+                        event.preventDefault()
+                        toggleListSearch()
+                      }
+                    },
+                    'aria-label': t('searchFavorites'),
+                  }),
+                ),
+              ),
+              h(
+                'div',
+                { className: 'bili-audio-list-tail' },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'bili-audio-import',
+                    onClick: () => {
+                      if (fileInputRef.current !== null) fileInputRef.current.click()
+                    },
+                    title: t('importMusic'),
+                  },
+                  h('span', { className: 'bili-audio-import-plus', 'aria-hidden': 'true' }, '+'),
+                  t('importMusic'),
+                ),
+                h('input', {
+                  type: 'file',
+                  accept: 'audio/*,.mp3,.m4a,.flac,.wav,.ogg,.opus,.aac',
+                  multiple: true,
+                  ref: fileInputRef,
+                  className: 'bili-audio-file',
+                  onChange: (event) => {
+                    player.importFiles(event.target.files)
+                    event.target.value = ''
+                  },
+                }),
+                h(
+                  'span',
+                  { className: 'bili-audio-list-count' },
+                  listNeedle === '' ? `${tracks.length} ${t('count')}` : `${visibleTracks.length} / ${tracks.length}`,
+                ),
+              ),
             ),
             list,
           ),
+          ),
+        ),
+        h(
+          'div',
+          { className: 'bili-audio-dock' },
+          h('div', { className: 'bili-audio-dock-inner' }, playerCard),
         ),
       )
     }
@@ -1508,6 +2165,81 @@ input.bili-audio-range-sm{width:70px;height:14px;accent-color:var(--dsw-alias-br
             player.dispose()
           },
           'bilibili-audio: player lifetime',
+        )
+
+        // System media controls: the OS cannot attach taskbar-thumbnail buttons
+        // to a page, but Media Session still puts the cover, title and
+        // play / pause / next on the Windows volume flyout and media keys.
+        ctx.effect(
+          () => {
+            if (typeof navigator === 'undefined' || navigator.mediaSession === undefined) return () => {}
+            const session = navigator.mediaSession
+            const handlers = {
+              play: () => player.toggle(),
+              pause: () => player.toggle(),
+              nexttrack: () => player.step(1),
+              previoustrack: () => player.step(-1),
+            }
+            for (const name of Object.keys(handlers)) {
+              try {
+                session.setActionHandler(name, handlers[name])
+              } catch {
+                /* unsupported action */
+              }
+            }
+            let lastId = ''
+            const sync = () => {
+              const snapshot = player.getSnapshot()
+              const current = snapshot.current
+              try {
+                session.playbackState = snapshot.playing === true ? 'playing' : 'paused'
+              } catch {
+                /* ignore */
+              }
+              if (current === null) {
+                lastId = ''
+                try {
+                  session.metadata = null
+                } catch {
+                  /* ignore */
+                }
+                return
+              }
+              if (current.bvid === lastId) return
+              lastId = current.bvid
+              try {
+                const artwork = []
+                if (typeof current.cover === 'string' && current.cover.length > 0) {
+                  artwork.push({ src: current.cover, sizes: '512x512', type: 'image/jpeg' })
+                }
+                session.metadata = new MediaMetadata({
+                  title: current.title || current.bvid,
+                  artist: current.owner || 'B站音频',
+                  artwork,
+                })
+              } catch {
+                /* MediaMetadata unsupported */
+              }
+            }
+            sync()
+            const unsubscribe = player.subscribe(sync)
+            return () => {
+              unsubscribe()
+              for (const name of Object.keys(handlers)) {
+                try {
+                  session.setActionHandler(name, null)
+                } catch {
+                  /* ignore */
+                }
+              }
+              try {
+                session.metadata = null
+              } catch {
+                /* ignore */
+              }
+            }
+          },
+          'bilibili-audio: system media session',
         )
 
         const openPanel = () => {
